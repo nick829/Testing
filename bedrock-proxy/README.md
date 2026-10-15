@@ -8,6 +8,18 @@ An authenticated Minecraft Bedrock relay built on [`bedrock-protocol`](https://w
 - A Bedrock destination server reachable over UDP/RakNet.
 - An authorized Minecraft account/client and permission to connect through the proxy.
 
+The project `.npmrc` explicitly leaves lifecycle scripts enabled. The locked `raknet-native` install hook performs its own binding check and compiles the addon when no compatible binding is present. Do not install with `--ignore-scripts` when building the native addon.
+
+## Build a FeatherPanel Native Artifact
+
+The repository-root GitHub Actions workflow at [`../.github/workflows/build-raknet.yml`](../.github/workflows/build-raknet.yml) builds the lockfile's `raknet-native` dependency on Linux x64 with Node.js 25.9.0 / ABI 141. It installs CMake, Make, Python 3, Git, and a C++ compiler; runs `npm ci` with lifecycle scripts enabled; checks that the compiled addon loads; verifies `ldd` has no missing libraries; and uploads a ZIP while preserving the loader path `node_modules/raknet-native/build/Release/node-raknet.node`.
+
+To download it, push this project to GitHub, open **Actions**, select **Build raknet-native**, choose **Run workflow**, and open the completed run. Download the artifact named `raknet-native-linux-x64-node-25.9.0-abi-141` from the run summary. The workflow's artifact is retained for 30 days.
+
+In FeatherPanel, first let the existing dependency install finish (it may report the native build failure but leave `node_modules/raknet-native` present). Upload the downloaded ZIP into `/home/container` and use File Manager's **Extract** action at that directory. It should create/replace only `node_modules/raknet-native/build/Release/node-raknet.node`; do not rename the `.node` file or replace other project files. Then restart the server. If you run `npm install` again, leave lifecycle scripts enabled: `raknet-native` will detect and load the uploaded binding. The ZIP also contains `BUILD-INFO.txt` and `ldd.txt`; if `native-libs/` is present, extract it at the same project root alongside `node_modules/`.
+
+The actual source build and Node 25.9.0 load test succeeded in the development workspace. A GitHub-hosted downloadable artifact will exist only after the workflow completes on your repository. The workflow uses Ubuntu 22.04 to reduce the glibc baseline, but FeatherPanel's exact glibc/libstdc++ versions are not specified here; compare them with the workflow's `ldd.txt` if the container still reports a shared-library version error.
+
 ## Setup
 
 ```sh
@@ -16,6 +28,8 @@ npm install
 cp .env.example .env
 npm start
 ```
+
+Or launch from any directory with `bash /path/to/bedrock-proxy/start.sh`. The script changes into the project directory, checks for Node.js 24+, installs dependencies with `npm ci` if needed, and starts the proxy.
 
 Set `SERVER_HOST` and `SERVER_PORT` to the destination. The defaults listen on UDP `0.0.0.0:19132` and forward to `127.0.0.1:19133`. The default `RAKNET_BACKEND=jsp-raknet` uses the protocol library's JavaScript RakNet implementation and does not require native install scripts. Set `BEDROCK_VERSION` only when you need to pin a version supported by the installed `bedrock-protocol` release; otherwise the library default is used.
 

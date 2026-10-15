@@ -1,0 +1,158 @@
+name: Build raknet-native
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - bedrock-proxy/package.json
+      - bedrock-proxy/package-lock.json
+      - bedrock-proxy/.npmrc
+      - .github/workflows/build-raknet.yml
+  pull_request:
+    paths:
+      - bedrock-proxy/package.json
+      - bedrock-proxy/package-lock.json
+      - bedrock-proxy/.npmrc
+      - .github/workflows/build-raknet.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-x64:
+    name: Linux x64 / Node 25.9.0 / ABI 141
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: bedrock-proxy
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 25.9.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 25.9.0
+          cache: npm
+          cache-dependency-path: bedrock-proxy/package-lock.json
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake make python3 git zip file patchelf
+
+      - name: Report build environment
+        run: |
+          node --version
+          npm --version
+          node -p "'Node ABI: ' + process.versions.modules + ', N-API: ' + process.versions.napi"
+          cmake --version
+          make --version | head -n 1
+          python3 --version
+          g++ --version | head -n 1
+          git --version
+          ldd --version | head -n 1
+          node -e "if (process.version !== 'v25.9.0' || process.versions.modules !== '141') { throw new Error('Expected Node 25.9.0 / ABI 141') }"
+
+      - name: Install locked dependencies and compile native addon
+        env:
+          npm_config_ignore_scripts: 'false'
+        run: npm ci --foreground-scripts --ignore-scripts=false
+
+      - name: Verify compiled addon and runtime links
+        shell: bash
+        run: |
+          set -euo pipefail
+          binding="node_modules/raknet-native/build/Release/node-raknet.node"
+          if [[ ! -f "$binding" ]]; then
+            echo "ERROR: CMake completed without producing $binding" >&2
+            find node_modules/raknet-native -maxdepth 5 -name '*.node' -print >&2
+            exit 1
+          fi
+
+          file "$binding"
+          ldd "$binding" | tee raknet-ldd.txt
+          if grep -Fq 'not found' raknet-ldd.txt; then
+            echo "ERROR: the native addon has unresolved shared libraries" >&2
+            exit 1
+          fi
+
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          if (process.version !== 'v25.9.0' || process.versions.modules !== '141') {
+            throw new Error(`Unexpected runtime: Node ${process.version}, ABI ${process.versions.modules}`)
+          }
+          const binding = path.resolve('node_modules/raknet-native/build/Release/node-raknet.node')
+          if (!fs.statSync(binding).isFile()) throw new Error(`Missing compiled binding: ${binding}`)
+          const native = require('./node_modules/raknet-native')
+          if (typeof native.RakClient !== 'function' || typeof native.RakServer !== 'function') {
+            throw new Error('Native addon loaded but expected RakClient/RakServer exports are missing')
+          }
+          console.log(`Loaded compiled addon: ${binding}`)
+          console.log(`Node ${process.version}; ABI ${process.versions.modules}; exports: ${Object.keys(native).join(', ')}`)
+          NODE
+
+      - name: Package binding and non-system shared libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_binding="node_modules/raknet-native/build/Release/node-raknet.node"
+          staging="artifacts/staging"
+          packaged_binding="$staging/node_modules/raknet-native/build/Release/node-raknet.node"
+          mkdir -p "$(dirname "$packaged_binding")" "$staging/native-libs"
+          cp "$source_binding" "$packaged_binding"
+
+          while IFS= read -r line; do
+            [[ "$line" == *"=>"* ]] || continue
+            dependency_path="$(awk '{print $3}' <<< "$line")"
+            [[ -f "$dependency_path" ]] || continue
+            case "$dependency_path" in
+              /lib/*|/usr/lib/*) ;;
+              *) cp -L "$dependency_path" "$staging/native-libs/" ;;
+            esac
+          done < <(ldd "$packaged_binding")
+
+          if compgen -G "$staging/native-libs/*" > /dev/null; then
+            for library in "$staging"/native-libs/*; do
+              patchelf --set-rpath '$ORIGIN' "$library"
+            done
+            patchelf --set-rpath '$ORIGIN/../../../../native-libs' "$packaged_binding"
+          else
+            rmdir "$staging/native-libs"
+            echo "No non-system shared libraries need bundling."
+          fi
+
+          ldd "$packaged_binding" | tee "$staging/ldd.txt"
+          if grep -Fq 'not found' "$staging/ldd.txt"; then
+            echo "ERROR: packaged addon still has unresolved shared libraries" >&2
+            exit 1
+          fi
+
+          {
+            printf 'Platform: Linux x64\n'
+            printf 'Node.js: %s\n' "$(node --version)"
+            printf 'Node ABI: %s\n' "$(node -p 'process.versions.modules')"
+            printf 'raknet-native: %s\n' "$(node -p "require('./node_modules/raknet-native/package.json').version")"
+            printf 'Binding: node_modules/raknet-native/build/Release/node-raknet.node\n'
+          } > "$staging/BUILD-INFO.txt"
+
+          zip_inputs=(node_modules/raknet-native/build/Release/node-raknet.node BUILD-INFO.txt ldd.txt)
+          if [[ -d "$staging/native-libs" ]]; then
+            zip_inputs+=(native-libs)
+          fi
+          (cd "$staging" && zip -r ../raknet-native-linux-x64-node-25.9.0-abi-141.zip "${zip_inputs[@]}")
+          ls -lh artifacts/raknet-native-linux-x64-node-25.9.0-abi-141.zip
+
+      - name: Upload downloadable binding artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raknet-native-linux-x64-node-25.9.0-abi-141
+          path: bedrock-proxy/artifacts/raknet-native-linux-x64-node-25.9.0-abi-141.zip
+          if-no-files-found: error
+          retention-days: 30
